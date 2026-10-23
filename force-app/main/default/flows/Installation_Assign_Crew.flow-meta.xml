@@ -30,23 +30,7 @@
             </value>
         </assignmentItems>
         <connector>
-            <targetReference>Flat</targetReference>
-        </connector>
-    </assignments>
-    <assignments>
-        <name>Rasie_to_3</name>
-        <label>Rasie to 3</label>
-        <locationX>0</locationX>
-        <locationY>0</locationY>
-        <assignmentItems>
-            <assignToReference>$Record.Crew_Size__c</assignToReference>
-            <operator>Assign</operator>
-            <value>
-                <numberValue>3.0</numberValue>
-            </value>
-        </assignmentItems>
-        <connector>
-            <targetReference>Crew_Over_Cap</targetReference>
+            <targetReference>Flat_roof_minimum</targetReference>
         </connector>
     </assignments>
     <assignments>
@@ -65,28 +49,6 @@
             <targetReference>Crew_Over_Cap</targetReference>
         </connector>
     </assignments>
-    <decisions>
-        <name>Flat</name>
-        <label>Flat Roof minimum</label>
-        <locationX>0</locationX>
-        <locationY>0</locationY>
-        <defaultConnectorLabel>Default Outcome</defaultConnectorLabel>
-        <rules>
-            <name>Yes</name>
-            <conditionLogic>and</conditionLogic>
-            <conditions>
-                <leftValueReference>$Record.Roof_Type__c</leftValueReference>
-                <operator>EqualTo</operator>
-                <rightValue>
-                    <stringValue>Flat</stringValue>
-                </rightValue>
-            </conditions>
-            <connector>
-                <targetReference>Rasie_to_3</targetReference>
-            </connector>
-            <label>Yes</label>
-        </rules>
-    </decisions>
     <decisions>
         <description>Is the crew larger than the cap this installation allows?</description>
         <name>Crew_Over_Cap</name>
