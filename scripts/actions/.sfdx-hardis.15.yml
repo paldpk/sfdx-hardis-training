@@ -1,0 +1,9 @@
+commandsPostDeploy:
+  - id: f257d25a-cd58-48c9-8f26-d87ca411b10c
+    label: Upload data
+    type: data
+    command: ""
+    parameters:
+      sfdmuProject: Handoveritem
+    runOnlyOnceByOrg: true
+    context: process-deployment-only
