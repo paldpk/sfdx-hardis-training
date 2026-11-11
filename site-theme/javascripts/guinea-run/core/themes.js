@@ -22,6 +22,7 @@ const SIXTEENTHS = "xxxxxxxxxxxxxxxx";
 // Lo-fi drums: a lazy kick and a soft backbeat
 const LOFI_KICK = "x......x..x.....";
 const LOFI_CLAP = "....o.......o...";
+export const MOTIF = "3q7u3uqzedwgw";
 
 export const THEMES = {
   // The map: a music box, no drums
@@ -299,6 +300,61 @@ export const THEMES = {
       ["verse", 4],
       ["chorus", 8],
       ["break", 4],
+      ["chorus", 8]
+    ]
+  },
+
+  // Pipeline Pinball: a bright arcade boogie, a walking bass under bells; the table counts its beat for mission 6
+  pinball: {
+    bpm: 124,
+    root: 62,
+    progression: [0, 3, 4, 4],
+    volume: 0.14,
+    leadVoice: "bell",
+    lead: {
+      a: melody("0.2.4.7.9...7... 4.5.7.9.b...9... 7.4.2.4.7...4... 2.4.5.4.2...1..."),
+      b: melody("7...9...b...9... 7.......4....... 5...7...9...7... 4.......2.......")
+    },
+    sections: {
+      intro: { kick: FOUR, bass: "x.......x......." },
+      verse: { kick: FOUR, hat: OFFBEATS, bass: "x.x.x.x.x.x.x.x.", stab: OFFBEATS },
+      chorus: { kick: FOUR, clap: BACKBEAT, hat: EIGHTHS, bass: "x.o.x.o.x.o.x.o.", arp: true, lead: "a" },
+      bridge: { kick: FOUR, clap: BACKBEAT, hat: SIXTEENTHS, bass: "x...x...x...x...", lead: "b" },
+      break: { pad: true, arp: true, bass: "x.......x......." }
+    },
+    form: [
+      ["intro", 2],
+      ["verse", 4],
+      ["chorus", 8],
+      ["bridge", 8],
+      ["break", 4],
+      ["chorus", 8]
+    ]
+  },
+
+  // Org-Man, the maze: a quick chase, a walking bass and a square lead that runs round the scale
+  orgman: {
+    bpm: 132,
+    root: 60,
+    progression: [0, 5, 3, 4],
+    volume: 0.13,
+    leadVoice: "square",
+    lead: {
+      a: melody("0.4.7.4.9.7.4.2. 0.2.4.5.7...4... 5.4.2.0.2.4.5.7. 9.7.5.4.2...0..."),
+      b: melody("7.7.9.7.4...2... 5.5.7.5.2...0... 4.5.7.9.b.9.7.5. 4.2.0.2.4.......")
+    },
+    sections: {
+      intro: { kick: FOUR, bass: "x.x.x.x.x.x.x.x." },
+      verse: { kick: FOUR, hat: OFFBEATS, bass: "x.o.x.o.x.o.x.o.", lead: "a" },
+      chorus: { kick: FOUR, clap: BACKBEAT, hat: EIGHTHS, bass: "x.o.x.o.x.o.x.o.", arp: true, lead: "b" },
+      break: { pad: true, arp: true, bass: "x.......x......." }
+    },
+    form: [
+      ["intro", 2],
+      ["verse", 8],
+      ["chorus", 8],
+      ["break", 4],
+      ["verse", 8],
       ["chorus", 8]
     ]
   },
