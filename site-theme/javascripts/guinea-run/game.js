@@ -17,7 +17,13 @@
  * and saves nothing, guinea-world=N opens world N directly (with
  * guinea-unlock=all), guinea-seed=N replays the same track, guinea-at=M
  * starts a runner M metres down its track, guinea-test=1 adds the test hooks
- * of window.__guineaRun to a normal game.
+ * of window.__guineaRun to a normal game. guinea-world=pinball and
+ * guinea-world=orgman open the bonuses, Pipeline Pinball and Org-Man, which
+ * every finished game unlocks (core/story.js BONUSES): each is loaded like a
+ * world, keeps its own card and its own board. guinea-online=fake plays the
+ * Hall of Fame against a database in memory (core/online-fake.js),
+ * guinea-online=live turns the real one on from a local copy of the site,
+ * guinea-online=0 turns it off.
  */
 import { translator } from "./texts.js";
 import { createHud } from "./hud.js";
@@ -25,14 +31,21 @@ import { createInput } from "./core/input.js";
 import { createEngine } from "./core/engine.js";
 import { createPainter, loadLogo } from "./core/painter.js";
 import { createProgress } from "./core/progress.js";
+import { installKind, rememberedInstalled } from "./core/install.js";
 import { createSound } from "./core/sound.js";
 import { seededRandom } from "./core/random.js";
-import { WORLDS, judgePlan } from "./core/story.js";
+import { WORLDS, BONUSES, bonusOf, judgePlan, modeOf } from "./core/story.js";
 import { createGuineaPig } from "./guinea-pig.js";
 import { createFx } from "./core/fx.js";
 import { createModels } from "./core/models.js";
 import { createMusic } from "./core/music.js";
 import { THEMES } from "./core/themes.js";
+import { TALLY_SET, stamp, stampPinball, stampOrgman } from "./core/tally.js";
+import { hasCheckpoint, loadCheckpoint, saveCheckpoint, clearCheckpoint } from "./core/checkpoint.js";
+import { GAME_ROWS, GAME_VERSION, boardId, bonusTarget, collectResults, loadList } from "./core/hof.js";
+import { boardOf as boardOfResult, createNet, createSync } from "./core/online.js";
+import { createFakeDb, fakeFetch, seedFakeDb } from "./core/online-fake.js";
+import { ONLINE_URL, ONLINE_KEY } from "./core/online-config.js";
 
 // scripts/build/vendor-three.mjs copies the add-ons of this same version
 const THREE_VERSION = "0.186.1";
@@ -44,6 +57,15 @@ const ATTEMPTS = 5;
 // right speed and nothing passes through the guinea pig between two frames
 const STEP_DT = 1 / 30;
 const COMBO_WINDOW = 2.5;
+// The most a boss beaten at its par time (WORLDS[].par) adds to the score
+const SPEED_BONUS = 300;
+// A world without a mistake, less this much per attempt lost, never below 0
+const CLEAN_BONUS = 250;
+const MISTAKE_COST = 50;
+// Victor's note found in the world
+const NOTE_BONUS = 200;
+// How long a board read from the Hall of Fame is reused before it is read again
+const BOARD_REUSE_MS = 60000;
 
 let active = null;
 
@@ -63,9 +85,20 @@ function createGame(options) {
   const unlockAll = params.get("guinea-unlock") === "all";
   // The test hooks of window.__guineaRun, for scripts/verify/check-easter-egg.mjs
   const testHooks = unlockAll || params.get("guinea-test") === "1";
-  const directWorld = unlockAll && params.has("guinea-world") ? Number(params.get("guinea-world")) : null;
+  const directWorld = unlockAll && params.has("guinea-world") ? (bonusOf(params.get("guinea-world")) ? params.get("guinea-world") : Number(params.get("guinea-world"))) : null;
   const seedParam = params.get("guinea-seed");
   const startAt = Number(params.get("guinea-at")) || 0;
+  // A run a check can steer is never signed, so it never reaches the Hall of Fame
+  const testMode = testHooks || seedParam !== null || startAt > 0;
+  // The Hall of Fame database. A test run only ever sends to the fake one; a
+  // local copy of the site sends nothing unless asked (guinea-online=live)
+  const onlineParam = params.get("guinea-online");
+  const localCopy = /^(127\.0\.0\.1|localhost)$/.test(window.location.hostname);
+  const fakeDb = onlineParam === "fake" ? createFakeDb() : null;
+  const onlineOn = !fakeDb && onlineParam !== "0" && !testMode && (!localCopy || onlineParam === "live");
+  const net = createNet(fakeDb ? { url: "https://guinea-run.invalid", key: "fake", fetch: fakeFetch(fakeDb) } : onlineOn ? { url: ONLINE_URL, key: ONLINE_KEY } : {});
+  // The home screen app is offered once a visit (installHint)
+  let installOffered = false;
 
   // The Cloudity logo, the badges and the labs are the site's own files
   const logoUrl = new URL("../../images/cloudity-text-logo-white.svg", options.base).href;
@@ -97,9 +130,21 @@ function createGame(options) {
   // The world being played, and the run of it
   let current = null;
   let run = null;
+  // The boards as last read (by board id), and where the Hall of Fame card was opened from
+  const boards = new Map();
+  let hofFrom = null;
+  // What the last end card asked of the Hall of Fame, a signature on its way
+  let winAsk = 0;
+  let signing = Promise.resolve();
+  // The score the open bonus must pass to enter the top 5 of its board (0: no flash)
+  let pinTarget = 0;
+  // The bests of a test session, for the fake database only
+  const testResults = new Map();
+  // Once the player joined, every new best goes to the Hall of Fame on its own
+  const sync = createSync({ progress, net, results: syncResults, onStatus: (summary) => summary.sent.length && boards.clear() });
 
   loadStylesheet(options.base + "guinea-run.css");
-  const hud = createHud(shellT, { logoUrl, badgeUrl, labs, lang });
+  const hud = createHud(shellT, { logoUrl, badgeUrl, labs, lang, hostSave: Boolean(options.hostSave) });
   const overlay = hud.overlay;
   document.body.appendChild(overlay);
   document.documentElement.classList.add("guinea-run-open");
@@ -110,6 +155,11 @@ function createGame(options) {
     target.addEventListener(type, handler, opts);
     cleanups.push(() => target.removeEventListener(type, handler, opts));
   }
+
+  // What waited for the network goes as soon as it is back; the first sync waits for the game to settle
+  listen(window, "online", () => sync.run());
+  const firstSync = setTimeout(() => sync.run(), 1500);
+  cleanups.push(() => clearTimeout(firstSync), () => sync.stop());
 
   // No scrolling or zooming the page behind the game on a phone
   listen(
@@ -129,12 +179,61 @@ function createGame(options) {
     }
   });
   listen(window, "blur", pause);
+  // play.html: the browser offered the install late, the player answered its box, or the game got installed
+  listen(window, "guinea-run-install", refreshInstall);
 
   const disposeInput = createInput(overlay, hud.canvas, onAction, {
-    tapOnDown: () => state === "playing" && Boolean(current) && String(current.module.PADS) === "jump"
+    tapOnDown: () => state === "playing" && Boolean(current) && String(current.module.PADS) === "jump",
+    // The bonus table plays with held keys and touches
+    hold: () => state === "playing" && Boolean(current && current.world) && current.module.PADS === "flippers",
+    onHold: (name, down) => current && current.world && current.world.hold && current.world.hold(name, down),
+    // The maze turns while the finger moves
+    swipeOnMove: () => state === "playing" && Boolean(current && current.world) && current.module.SWIPE === "move"
   });
 
+  /** The world a button names: a world id, or a bonus id ("pinball", "orgman"). */
+  function worldOf(element) {
+    const value = element && element.getAttribute("data-world");
+    return bonusOf(value) ? value : Number(value);
+  }
+
+  /** Every world done (or a check that opens everything): the bonuses are open. */
+  function bonusOpen() {
+    return unlockAll || progress.bonusOpen(WORLDS);
+  }
+
+  /** Whether the world played is a bonus. */
+  function playingBonus() {
+    return Boolean(current && bonusOf(current.info.id));
+  }
+
+  /** The bonuses whose teaser was never shown, now that they are open. */
+  function unseenTeasers() {
+    return bonusOpen() && !testMode ? BONUSES.filter((b) => !progress.bonusOf(b.id).teaserSeen).map((b) => b.id) : [];
+  }
+
+  /** Shows the teaser of the bonuses never shown, once. Returns whether it did. */
+  function showTeaser(fromCredits) {
+    const ids = unseenTeasers();
+    if (!ids.length) {
+      return false;
+    }
+    for (const id of ids) {
+      progress.setTeaserSeen(id);
+    }
+    track("easter_egg_bonus_teaser", { from: fromCredits ? "credits" : "map", bonuses: ids.join(",") });
+    hud.teaser(fromCredits, ids);
+    return true;
+  }
+
   function onAction(action, element) {
+    // The join modal holds the keys: Escape is No thanks, the rest waits for its answer
+    if (hud.joinOpen() && action !== "mute" && action !== "retry-load") {
+      if (action === "quit") {
+        hud.skipJoin();
+      }
+      return;
+    }
     if (action === "quit") {
       stop();
       return;
@@ -165,11 +264,54 @@ function createGame(options) {
     switch (action) {
       case "play":
         if (element && element.hasAttribute("data-world")) {
-          openWorld(Number(element.getAttribute("data-world")));
+          openWorld(worldOf(element));
         }
+        return;
+      case "bonus":
+        openWorld(element && bonusOf(element.getAttribute("data-world")) ? element.getAttribute("data-world") : "pinball");
+        return;
+      case "bonus-new":
+        startBonus(false);
+        return;
+      case "bonus-resume":
+        startBonus(true);
         return;
       case "map":
         showMap();
+        return;
+      case "install":
+        if (options.install) {
+          const trigger = state === "map" ? "map" : options.trigger;
+          track("easter_egg_install", { trigger });
+          if (element) {
+            element.hidden = true;
+          }
+          options.install
+            .prompt()
+            .then((outcome) => track("easter_egg_install_choice", { trigger, outcome }))
+            .catch(() => {});
+        }
+        return;
+      case "install-page":
+        // From a course page, the game page, where it installs
+        track("easter_egg_install", { trigger: state === "map" ? "map" : options.trigger, kind: "page" });
+        window.location.href = gamePageUrl();
+        return;
+      case "mode":
+        if (state === "map" && element && element.hasAttribute("data-mode")) {
+          progress.setMode(modeOf(element.getAttribute("data-mode")).id);
+          track("easter_egg_mode", { mode: progress.mode });
+          showMap();
+        }
+        return;
+      case "hof":
+        showHallOfFame(element && element.hasAttribute("data-world") ? worldOf(element) : "all", current ? current.info.id : null);
+        return;
+      case "hof-tab":
+        if (state === "hof" && element) {
+          const tab = element.getAttribute("data-tab");
+          showHallOfFame(tab === "all" || bonusOf(tab) ? tab : Number(tab), hofFrom);
+        }
         return;
       case "start":
         startWorld();
@@ -182,7 +324,10 @@ function createGame(options) {
         return;
       case "credits-card":
         if (state === "credits") {
-          hud.creditsCard();
+          // The first time, the roll ends on the bonuses: one more thing
+          if (!showTeaser(true)) {
+            hud.creditsCard();
+          }
         }
         return;
       case "credits-roll":
@@ -205,6 +350,14 @@ function createGame(options) {
         resume();
         return;
       }
+      if (playingBonus() && (state === "intro" || state === "done")) {
+        if (state === "done") {
+          showMap();
+        } else {
+          startBonus(current.info.id === "pinball" && hasCheckpoint());
+        }
+        return;
+      }
       if (state === "intro" || state === "failed") {
         startWorld();
         return;
@@ -223,6 +376,10 @@ function createGame(options) {
     if (state === "playing") {
       state = "paused";
       engine.setActive(false);
+      // The bonus table saves its game, and lets its flippers down
+      if (current && current.world && current.world.pause) {
+        current.world.pause();
+      }
       hud.paused({ renderer: engine.backend === "webgpu" ? "WebGPU" : "WebGL 2", fps: Math.round(engine.fps), tier: engine.tier });
     }
   }
@@ -286,10 +443,15 @@ function createGame(options) {
     if (testHooks) {
       exposeTestHooks();
     }
-    if (directWorld !== null && WORLDS[directWorld]) {
+    if (directWorld !== null && (WORLDS[directWorld] || bonusOf(directWorld))) {
       openWorld(directWorld);
     } else {
       showMap();
+      // The shared save of VS Code was edited by hand: play.html cleared it, the player hears why
+      if (options.saveRefused) {
+        track("easter_egg_save_refused", { trigger: options.trigger });
+        hud.saveRefused();
+      }
     }
   }
 
@@ -316,16 +478,27 @@ function createGame(options) {
     hud.clearWorldUi();
     hud.setPads([]);
     overlay.removeAttribute("data-world");
-    hud.map(progress, () => {
-      progress.reset();
-      hud.setBadges([]);
-      showMap();
-    });
+    // A player who finished the game before a bonus existed sees its teaser once
+    if (showTeaser(false)) {
+      return;
+    }
+    hud.map(
+      progress,
+      () => {
+        progress.reset();
+        clearCheckpoint();
+        hud.setBadges([]);
+        showMap();
+      },
+      BONUSES.map((b) => ({ id: b.id, open: bonusOpen(), best: progress.bonusOf(b.id).best, hasSave: b.id === "pinball" && hasCheckpoint() })),
+      installOffer()
+    );
   }
 
   async function openWorld(id) {
-    const info = WORLDS[id];
-    if (!info || (id > progress.unlocked && !unlockAll)) {
+    const bonus = bonusOf(id);
+    const info = bonus || WORLDS[id];
+    if (!info || (bonus ? !bonusOpen() : id > progress.unlocked && !unlockAll)) {
       showMap();
       return;
     }
@@ -378,8 +551,69 @@ function createGame(options) {
     engine.setActive(false);
     // A world says how it is played in three short steps: how1, how2, how3
     const how = ["how1", "how2", "how3"].map((key) => current.t(key)).filter((text, i) => text && text !== "how" + (i + 1));
-    hud.intro(info, progress.world(id), current.t("intro"), how, module.PADS);
+    if (bonus) {
+      readBonusTarget();
+      hud.bonusIntro({ id: info.id, story: current.t("intro"), how, best: progress.bonusOf(info.id).best, hasSave: info.id === "pinball" && hasCheckpoint() });
+    } else {
+      hud.intro(info, progress.world(id), current.t("intro"), how, module.PADS, modeOf(progress.mode));
+    }
     track("easter_egg_world_open", { world: id });
+  }
+
+  /** Starts a bonus: a new game, or for the table the saved one (a saved game that was changed starts a new one). */
+  async function startBonus(resume) {
+    if (!playingBonus()) {
+      return;
+    }
+    let saved = null;
+    if (resume && current.info.id === "pinball") {
+      const read = await loadCheckpoint();
+      if (read && read.state) {
+        saved = read.state;
+      } else if (read && read.broken) {
+        clearCheckpoint();
+        hud.toast(shellT("bonusSaveBroken"), "bad");
+      }
+    }
+    if (!playingBonus() || (state !== "intro" && state !== "done")) {
+      return;
+    }
+    if (state !== "intro") {
+      createCurrentWorld();
+    }
+    state = "playing";
+    hud.playing();
+    engine.setActive(true);
+    current.world.start({ resume: saved });
+    track("easter_egg_bonus_start", { bonus: current.info.id, resume: Boolean(saved) });
+  }
+
+  /** The end of a game of a bonus: its record, the Hall of Fame, the card. */
+  function bonusOver(summary) {
+    if (!run || run.ended) {
+      return;
+    }
+    run.ended = true;
+    state = "done";
+    engine.setActive(false);
+    const id = current.info.id;
+    const before = progress.bonusOf(id).best;
+    const record =
+      id === "orgman"
+        ? { org: 1, sc: summary.score, ms: summary.ms, lv: summary.level, gh: summary.admins, at: Date.now(), v: GAME_VERSION, k: TALLY_SET }
+        : { pin: 1, sc: summary.score, ms: summary.ms, lv: summary.level, mi: summary.missions, nt: summary.notes, at: Date.now(), v: GAME_VERSION, k: TALLY_SET };
+    const newBest = testMode ? summary.score > before : progress.completeBonus(summary.score, record, id);
+    if (newBest && !testMode) {
+      const stamper = id === "orgman" ? stampOrgman : stampPinball;
+      signing = stamper(record).then((sg) => sg && progress.setBonusRecord(Object.assign({}, record, { sg }), id));
+    }
+    if (testMode && fakeDb) {
+      keepTestResult(record);
+    }
+    track("easter_egg_bonus_over", { bonus: id, score: summary.score, level: summary.level, missions: summary.missions, admins: summary.admins, minutes: Math.round(summary.ms / 60000), trigger: options.trigger });
+    sound.play(newBest ? "fanfare" : "happy");
+    hud.bonusResult(Object.assign({ id, best: Math.max(before, summary.score), newBest }, summary));
+    afterWin(id, summary.score);
   }
 
   /** Builds the world from its module, fresh: every attempt of a world starts clean. */
@@ -391,7 +625,10 @@ function createGame(options) {
     engine.resetLook();
     hud.clearWorldUi();
     resetPig();
-    run = { score: 0, attempts: ATTEMPTS, lost: 0, note: false, tip: "", combo: 0, comboTime: -10, ended: false };
+    // The mode is read once per run: a world is played in one mode from start to end.
+    // The bonuses ignore it: same points in every mode, so the same speed (Easy's)
+    const mode = playingBonus() ? modeOf("easy") : modeOf(progress.mode);
+    run = { score: 0, attempts: ATTEMPTS, lost: 0, note: false, tip: "", combo: 0, comboTime: -10, ended: false, bossClock: null, bossDone: false, mode };
     const root = new THREE.Group();
     engine.scene.add(root);
     const paint = createPainter(THREE);
@@ -399,7 +636,9 @@ function createGame(options) {
     current.paint = paint;
     hud.setPads(current.module.PADS || ["left", "right", "jump", "duck"]);
     current.world = current.module.createWorld(makeContext(root, paint));
-    updateHud();
+    if (!playingBonus()) {
+      updateHud();
+    }
   }
 
   function startWorld() {
@@ -455,7 +694,9 @@ function createGame(options) {
    *
    * Actions are left, right, jump, duck, confirm and tap. A world calls
    * ctx.collect / ctx.loseAttempt / ctx.foundNote while it plays, and
-   * ctx.finish() or ctx.fail(tip) once, at its end.
+   * ctx.finish() or ctx.fail(tip) once, at its end. A world with a boss calls
+   * ctx.bossStarted() when the fight starts and ctx.bossBeaten() when the boss
+   * is down: with a par time (WORLDS[].par) a fast fight earns a speed bonus.
    */
   function makeContext(root, paint) {
     const info = current.info;
@@ -475,7 +716,19 @@ function createGame(options) {
       lang,
       sound,
       world: info,
-      params: { startAt },
+      params: { startAt, testMode, seed: Number(seedParam) || 0 },
+      /** The score a bonus must pass to enter the top 5 of its board, 0 when there is nothing to flash. */
+      get hofTarget() {
+        return pinTarget;
+      },
+      /** The best game of the bonus played, in this browser. */
+      get bonusBest() {
+        return bonusOf(info.id) ? progress.bonusOf(info.id).best : 0;
+      },
+      /** How much faster than Easy the world runs (1, 1.5 or 2): its update already gets the faster time, a musical run sets its tempo with it. */
+      get speed() {
+        return run.mode.speed;
+      },
       random: seededRandom(seedParam ? Number(seedParam) + info.id : Date.now() & 0xffffffff),
       get attempts() {
         return run.attempts;
@@ -563,6 +816,24 @@ function createGame(options) {
         sound.play("note");
         hud.note(current.t("note"));
       },
+      /**
+       * The boss fight starts now, once its opening lines are said (a longer
+       * line in another language costs nothing): the time to beat it counts
+       * from here, on the game clock, so a pause stops it. Once per run: a
+       * world with two bosses calls it at each, the clock runs from the first.
+       */
+      bossStarted() {
+        if (!run.ended && run.bossClock === null) {
+          run.bossClock = 0;
+          run.bossDone = false;
+        }
+      },
+      /** The boss is down: the clock stops, even if the world plays on (a musical run ends with its song). */
+      bossBeaten() {
+        if (run.bossClock !== null) {
+          run.bossDone = true;
+        }
+      },
       /** Ends the world in success. info, when given, is what the player missed: shown on the result, never a reason to fail. */
       finish(bonus, info) {
         succeedWorld(bonus || 0, info);
@@ -576,6 +847,23 @@ function createGame(options) {
       setData(name, value) {
         overlay.setAttribute("data-" + name, String(value));
       },
+      /** The bonus table: its top bar, its saved game, its end. Nothing is saved by a check. */
+      bonus: {
+        hud(view) {
+          hud.update({ world: shellT(info.id === "orgman" ? "orgName" : "bonusName"), score: view.score, attempts: 0, maxAttempts: 0, label: view.ball });
+        },
+        saveCheckpoint(snapshot) {
+          return testMode ? Promise.resolve(false) : saveCheckpoint(snapshot);
+        },
+        clearCheckpoint() {
+          if (!testMode) {
+            clearCheckpoint();
+          }
+        },
+        over(summary) {
+          bonusOver(summary);
+        }
+      },
       get playing() {
         return state === "playing";
       }
@@ -588,28 +876,61 @@ function createGame(options) {
     }
     run.ended = true;
     run.score += bonus;
+    const info = current.info;
+    // A boss that was never beaten has no time, and no speed bonus
+    const bossMs = run.bossClock !== null && run.bossDone ? Math.round(run.bossClock * 1000) : null;
+    // The end bonuses, each a line of the end card
+    const bonuses = [];
+    const clean = Math.max(0, CLEAN_BONUS - run.lost * MISTAKE_COST);
+    run.score += clean;
+    bonuses.push(run.lost === 0 ? { key: "bonusClean", points: clean } : { key: "bonusMistakes", points: clean, n: run.lost });
+    if (run.note) {
+      run.score += NOTE_BONUS;
+      bonuses.push({ key: "bonusNote", points: NOTE_BONUS });
+    }
+    if (bossMs !== null && info.par) {
+      const seconds = bossMs / 1000;
+      const points = Math.round(SPEED_BONUS * Math.min(1, Math.max(0, 1 - (seconds - info.par) / (2 * info.par))));
+      run.score += points;
+      bonuses.push({ key: points > 0 ? "speedLine" : "speedLineNone", points, s: Math.round(seconds) });
+    }
+    // Last: the mode multiplies the whole score, bonuses included
+    if (run.mode.mult !== 1) {
+      run.score = Math.round(run.score * run.mode.mult);
+      bonuses.push({ key: "bonusMode", mode: shellT("mode_" + run.mode.id), mult: run.mode.mult });
+    }
     fx.burst(pig.object.position.x, pig.object.position.y + 1, pig.object.position.z, { count: 70, speed: 5, up: 6, life: 1.6 });
     pig.hop();
-    const info = current.info;
     const stars = 1 + (run.lost === 0 ? 1 : 0) + (run.note ? 1 : 0);
     if (run.note) {
       progress.addNote(info.id);
     }
     const before = progress.world(info.id).best;
     const last = info.id === WORLDS.length - 1;
-    const newBest = progress.complete(info.id, run.score, stars, last ? info.id : info.id + 1);
-    track("easter_egg_world_done", { world: info.id, stars, score: run.score, trigger: options.trigger });
+    const played = { w: info.id, sc: run.score, st: stars, bm: bossMs, m: run.mode.id, at: Date.now(), v: GAME_VERSION, k: TALLY_SET };
+    const record = testMode ? { test: true } : played;
+    const newBest = progress.complete(info.id, run.score, stars, last ? info.id : info.id + 1, record);
+    if (newBest && !testMode) {
+      // A few milliseconds: the card does not wait for it
+      signing = stamp(record).then((sg) => sg && progress.setRecord(info.id, Object.assign({}, record, { sg })));
+    }
+    if (testMode && fakeDb) {
+      keepTestResult(played);
+    }
+    track("easter_egg_world_done", { world: info.id, stars, score: run.score, mode: run.mode.id, trigger: options.trigger });
     engine.setActive(false);
-    const result = { ok: true, world: info, score: run.score, best: Math.max(before, run.score), newBest, stars, hasNext: !last, missed: missed || "" };
+    const result = { ok: true, world: info, score: run.score, best: Math.max(before, run.score), newBest, stars, hasNext: !last, missed: missed || "", bonuses, install: installHint() };
     const show = () => {
       if (last) {
         progress.setFinished();
         track("easter_egg_finished", { score: run.score, trigger: options.trigger });
         state = "credits";
         hud.credits(progress.badges, result);
+        signing.then(() => progress.online.id && sync.run());
       } else {
         state = "done";
         hud.result(result);
+        afterWin("w" + info.id, run.score);
       }
     };
     if (info.badge) {
@@ -640,11 +961,185 @@ function createGame(options) {
     hud.result({ ok: false, world: current.info, tip: run.tip });
   }
 
+  /* ---------- The Hall of Fame ---------- */
+
+  /** The card of the boards. tab: "all", a world id, "pinball" or "orgman". from: the world whose card opened it, or null for the map. */
+  async function showHallOfFame(tab, from) {
+    closeWorld();
+    state = "hof";
+    hofFrom = from;
+    engine.setActive(false);
+    showroom.visible = true;
+    resetPig();
+    engine.resetLook();
+    overlay.removeAttribute("data-world");
+    hud.clearWorldUi();
+    hud.setPads([]);
+    const view = profileView({ tab, from, onForget: forgetPlayer });
+    const cached = boards.get(boardId(tab));
+    if (!cached || Date.now() - cached.at > BOARD_REUSE_MS) {
+      hud.hallOfFame(Object.assign({ loading: true }, view));
+      const read = await readBoard(tab);
+      if (state !== "hof" || hofFrom !== from) {
+        return;
+      }
+      track("easter_egg_hof_open", { ok: read.ok });
+    }
+    const read = boards.get(boardId(tab)) || { list: [], ok: false };
+    hud.hallOfFame(Object.assign({ list: read.list, ok: read.ok, rank: read.rank }, view));
+  }
+
+  /** A board and the player's rank on it, kept BOARD_REUSE_MS. Never throws. */
+  async function readBoard(tab) {
+    const id = boardId(tab);
+    const profile = progress.online;
+    const [read, ranks] = await Promise.all([loadList(net, tab, GAME_ROWS), profile.id ? net.ranks(profile.id) : Promise.resolve({})]);
+    const entry = { list: read.list, ok: read.ok, rank: (ranks && ranks[id]) || null, at: Date.now() };
+    boards.set(id, entry);
+    return entry;
+  }
+
+  /** What the profile and join boxes need. */
+  function profileView(extra) {
+    return Object.assign({ profile: progress.online, online: net.enabled, testLink: testMode && !fakeDb, onSave: saveProfile }, extra);
+  }
+
+  /** The player joins, or changes their nickname or guinea pig: "saved", "later" or "refused". */
+  async function saveProfile(name, coat) {
+    const profile = progress.online;
+    if (!profile.id) {
+      progress.setOnline({ id: newPlayerId(), name, coat, asked: true });
+      track("easter_egg_hof_join", { coat });
+    } else {
+      progress.setOnline({ name, coat });
+      track("easter_egg_hof_rename", { coat });
+    }
+    const summary = await sync.run();
+    return summary.nameRefused ? "refused" : summary.later ? "later" : "saved";
+  }
+
+  /** "Remove me from the Hall of Fame": every row of this player is deleted, and nothing is sent any more. */
+  async function forgetPlayer() {
+    const profile = progress.online;
+    if (!profile.id || !(await net.forget(profile.id))) {
+      return false;
+    }
+    // left: a merge with an older copy of the save never brings this id back
+    progress.setOnline({ id: "", name: "", asked: true, left: profile.id });
+    boards.clear();
+    track("easter_egg_hof_forget", {});
+    return true;
+  }
+
+  /**
+   * After a won world or a bonus game, once its result is signed: the join
+   * modal the first time, otherwise the new best sent and a line that says so.
+   */
+  async function afterWin(board, score) {
+    const ask = ++winAsk;
+    const shown = state;
+    await signing;
+    if (ask !== winAsk || state !== shown || !net.enabled || (testMode && !fakeDb)) {
+      return;
+    }
+    const profile = progress.online;
+    if (!profile.id) {
+      if (!profile.asked) {
+        hud.joinOffer(profileView({ onSkip: () => progress.setOnline({ asked: true }) }), score);
+        track("easter_egg_hof_offer", { world: board });
+      }
+      return;
+    }
+    const summary = await sync.run();
+    if (ask !== winAsk || state !== shown) {
+      return;
+    }
+    if (summary.sent.includes(board)) {
+      hud.hofStatus("sent");
+    } else if (summary.later) {
+      hud.hofStatus("later");
+    }
+  }
+
+  /** What a sync sends: the signed results of this device; in a test with the fake database, the bests of this session. */
+  function syncResults() {
+    return fakeDb ? Array.from(testResults.values()) : collectResults(progress);
+  }
+
+  /** A session result for the fake database, signed with a stand-in: never stored, never sent to the real one. */
+  function keepTestResult(record) {
+    const board = boardOfResult(record);
+    const held = testResults.get(board);
+    if (!held || record.sc > held.sc) {
+      testResults.set(board, Object.assign({}, record, { sg: "test" }));
+    }
+  }
+
+  /**
+   * On a phone, the end card of a won world offers the home screen app, which
+   * plays offline (play.html, its manifest and sw.js). Once a visit. From a
+   * course page it opens the game page; there, an Android browser installs it
+   * at a tap, Safari and the others say where the menu entry is. Never in a
+   * frame or in the app itself (options.install is null there). The offer of
+   * the map (installOffer) does not use this visit up.
+   */
+  function installHint() {
+    if (installOffered) {
+      return null;
+    }
+    const offer = installOffer();
+    if (offer) {
+      installOffered = true;
+    }
+    return offer;
+  }
+
+  /** The offer of the map, on every map while the game is not installed. */
+  function installOffer() {
+    const offer = installKind(options.install, installDevice());
+    return offer && offer.kind === "page" ? { kind: "page", url: gamePageUrl() } : offer;
+  }
+
+  /** The install box on screen (map or end card) follows what play.html just learnt. */
+  function refreshInstall() {
+    if (state === "map" || hud.hasInstallBox()) {
+      hud.refreshInstall(installOffer());
+    }
+  }
+
+  function installDevice() {
+    return { touch: hud.touch, testMode, userAgent: navigator.userAgent, platform: navigator.platform, maxTouchPoints: navigator.maxTouchPoints, remembered: rememberedInstalled(storageOrNull()) };
+  }
+
+  function storageOrNull() {
+    try {
+      return window.localStorage;
+    } catch {
+      return null;
+    }
+  }
+
+  function gamePageUrl() {
+    return new URL("play.html?lang=" + lang, options.base).href;
+  }
+
+  /** What the open bonus must pass to flash TOP 5, read while its card shows. */
+  async function readBonusTarget() {
+    pinTarget = 0;
+    const id = current && current.info.id;
+    if (!bonusOf(id)) {
+      return;
+    }
+    const read = await readBoard(id);
+    pinTarget = read.ok && current && current.info.id === id ? bonusTarget(read.list, read.rank ? read.rank.rank : 0, progress.bonusOf(id).best) : 0;
+  }
+
   function updateHud() {
     if (!current || !run) {
       return;
     }
-    hud.update({ world: current.info.id + " · " + shellT("w" + current.info.id + "_name"), score: run.score, attempts: run.attempts, maxAttempts: ATTEMPTS });
+    const mode = run.mode.id === "easy" ? "" : " · " + shellT("mode_" + run.mode.id);
+    hud.update({ world: current.info.id + " · " + shellT("w" + current.info.id + "_name") + mode, score: run.score, attempts: run.attempts, maxAttempts: ATTEMPTS });
   }
 
   /* ---------- The trophy: the badge and the Cloudity logo, in 3D ---------- */
@@ -765,7 +1260,13 @@ function createGame(options) {
   function frame(dt, time) {
     updateBackgroundMusic(dt);
     if (state === "playing" && current && current.world) {
-      let left = dt;
+      // The mode runs the world faster; a musical run is faster through its tempo instead
+      const speed = run ? run.mode.speed : 1;
+      if (run && run.bossClock !== null && !run.bossDone && !run.ended) {
+        // Game time: a par time means the same in every mode
+        run.bossClock += dt * speed;
+      }
+      let left = current.module.OWN_SPEED ? dt : dt * speed;
       while (left > 1e-6 && state === "playing") {
         const slice = Math.min(left, STEP_DT);
         current.world.update(slice, time);
@@ -797,9 +1298,26 @@ function createGame(options) {
     window.__guineaRun = {
       state: () => state,
       world: () => (current ? current.info.id : null),
-      finish: () => current && current.world && succeedWorld(0),
+      finish: () => current && current.world && (playingBonus() ? bonusOver({ score: 1000, ms: 60000, level: 1, missions: 0, notes: 0, admins: 0 }) : succeedWorld(0)),
       fail: () => current && current.world && failWorld(),
       action: (name) => onAction(name, null),
+      bossClock: () => (run ? run.bossClock : null),
+      // The fake Hall of Fame database (guinea-online=fake): rival players to rank against, what it holds, the profile
+      online: {
+        seed: (players) => {
+          if (fakeDb) {
+            seedFakeDb(fakeDb, players);
+            boards.clear();
+            if (playingBonus()) {
+              readBonusTarget();
+            }
+          }
+        },
+        db: () => (fakeDb ? { names: fakeDb.names.map((r) => ({ name: r.name, coat: r.coat })), scores: fakeDb.scores.map((r) => ({ board: r.board, score: r.score })) } : null),
+        profile: () => progress.online,
+        sync: () => sync.run()
+      },
+      hofTarget: () => pinTarget,
       // The models stay loaded for the session: only what a world made itself counts
       geometries: () => (engine ? engine.renderer.info.memory.geometries - (models ? models.geometryCount : 0) : 0),
       textures: () => (engine ? engine.renderer.info.memory.textures : 0)
@@ -896,4 +1414,16 @@ function webglAvailable() {
   } catch {
     return false;
   }
+}
+
+/** A random player id: the only thing that tells two players apart in the Hall of Fame. */
+function newPlayerId() {
+  if (globalThis.crypto && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  const b = crypto.getRandomValues(new Uint8Array(16));
+  b[6] = (b[6] & 15) | 64;
+  b[8] = (b[8] & 63) | 128;
+  const h = Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+  return h.slice(0, 8) + "-" + h.slice(8, 12) + "-" + h.slice(12, 16) + "-" + h.slice(16, 20) + "-" + h.slice(20);
 }
