@@ -45,6 +45,23 @@
  *   a swipe and a pad move the guinea pig, the page never scrolls sideways
  * - Esc closes it and gives the page its scroll back; a page change under it
  *   removes it
+ * - Pipeline Pinball, the bonus table, stays hidden until every world is done,
+ *   then its teaser shows once; it opens, its flippers follow the held keys
+ *   and the halves of the screen, Deploy to all orgs puts three balls on the
+ *   table, a ball reaches the Production floor, the bot plays it for two
+ *   minutes without a ball ever leaving the table, a game ends on its card,
+ *   and the Hall of Fame has its board
+ * - Org-Man, the second bonus, opens with it: its teaser shows once, the
+ *   guinea pig follows the arrows through the maze, a rocket turns the admins
+ *   blue, the bot plays, the last dot clears the maze, the card between two
+ *   mazes shows and maze 2 starts, a game ends on its card with the join
+ *   box, and the Hall of Fame has its board
+ * - play.html, opened once online, saves the whole game (sw.js); with the
+ *   network cut, every world and both bonuses still open and world 1 plays
+ * - in the VS Code frame (play.html?from=vscode&save=host), the game asks the
+ *   page around it for the shared save, sends it signed after a change,
+ *   refuses one edited by hand (card, storage cleared, file deleted) and puts
+ *   a valid one back into its storage
  *
  * Three.js comes from jsDelivr, so this needs the network, like the site does.
  */
@@ -103,6 +120,22 @@ for (const world of WORLDS) {
     }
   }
 }
+// The bonuses are world modules too, each with its own card
+const { BONUSES } = await import(pathToFileURL(path.join(GAME, "core", "story.js")).href);
+for (const bonus of BONUSES) {
+  const module = await import(pathToFileURL(path.join(GAME, "worlds", bonus.module)).href);
+  expect(typeof module.createWorld === "function" && module.KIND === "bonus", `the bonus ${bonus.id} (${bonus.module}) exports createWorld`);
+  const missingFr = Object.keys(module.TEXTS.en).filter((key) => !(module.TEXTS.fr && key in module.TEXTS.fr));
+  expect(missingFr.length === 0, `the bonus ${bonus.id} has every key in French${missingFr.length ? ": missing " + missingFr.join(", ") : ""}`);
+  for (const quote of module.QUOTES || []) {
+    for (const locale of quote.locales || ["en", "fr"]) {
+      const file = labFile(locale, quote.lab);
+      if (!(file && fs.readFileSync(file, "utf8").includes(quote.text))) {
+        expect(false, `the bonus ${bonus.id} quotes "${quote.text}" from Lab ${quote.lab}, and labs/${locale} no longer says it`);
+      }
+    }
+  }
+}
 console.log("ok   every quote of the worlds is still in its lab, in English and in French (or listed above)");
 
 const labsModule = path.join(SITE, "theme", "javascripts", "guinea-run", "labs.js");
@@ -111,7 +144,7 @@ if (fs.existsSync(labsModule)) {
   const { LABS } = await import(pathToFileURL(labsModule).href);
   for (const locale of ["en", "fr"]) {
     const dead = [];
-    for (const world of WORLDS) {
+    for (const world of WORLDS.concat(BONUSES)) {
       for (const id of world.labs) {
         const lab = LABS[locale] && LABS[locale][id];
         if (!lab || !fs.existsSync(path.join(SITE, lab.url, "index.html"))) {
@@ -125,6 +158,9 @@ if (fs.existsSync(labsModule)) {
 
 /* ---------- In a browser ---------- */
 
+// The service worker's own requests go through the routes and the offline
+// switch too: the offline probe must not pass on a file the worker fetched
+process.env.PW_EXPERIMENTAL_SERVICE_WORKER_NETWORK_EVENTS = "1";
 let chromium;
 try {
   ({ chromium } = await import("playwright-core"));
@@ -171,6 +207,19 @@ const waitState = (page, values) =>
       () => true,
       () => false
     );
+
+// Whether the Hall of Fame box of the end card shows, and says this
+const hofBoxSays = (page, pattern) =>
+  page.textContent(".guinea-run .gr-modal-body .gr-hof-invite:not([hidden])", { timeout: 500 }).then(
+    (text) => pattern.test(text || ""),
+    () => false
+  );
+// Whether the join modal of a first score shows, and says this
+const joinSays = (page, pattern) =>
+  page.textContent(".guinea-run .gr-join", { timeout: 500 }).then(
+    (text) => pattern.test(text || ""),
+    () => false
+  );
 
 async function typeKeys(page, keys, gap) {
   for (const key of keys) {
@@ -351,7 +400,7 @@ try {
   // 4. Progress: finishing a world opens the next, and the browser remembers
   {
     const page = await newPage({ viewport: { width: 1280, height: 860 } });
-    await page.goto(`${site.base}en/?guinea-test=1`, { waitUntil: "load" });
+    await page.goto(`${site.base}en/?guinea-test=1&guinea-online=fake`, { waitUntil: "load" });
     await page.evaluate((key) => window.localStorage.removeItem(key), PROGRESS_KEY);
     await typeKeys(page, KONAMI_ARROWS);
     await waitState(page, "map");
@@ -361,6 +410,10 @@ try {
     await waitState(page, "playing");
     await page.evaluate(() => window.__guineaRun.finish());
     await waitState(page, "done");
+    expect(await settles(page, () => joinSays(page, /Join the Hall of Fame/), true, 10000), "the first won world opens the join modal over its end card");
+    await page.keyboard.press("Escape");
+    expect((await page.locator(".guinea-run .gr-join").count()) === 0 && (await state(page)) === "done", "Escape on the join modal is No thanks: the end card stays");
+    expect(await page.evaluate(() => window.__guineaRun.online.profile().asked), "No thanks is remembered: the join modal is asked once");
     await page.click('.guinea-run [data-action="map"]');
     await waitState(page, "map");
     expect((await page.locator('.guinea-run [data-action="play"][data-world="1"]').count()) === 1, "finishing world 0 opens world 1");
@@ -378,6 +431,113 @@ try {
   // blocks across the lanes, the tools caught fly to his laptop until his
   // excuses run out, he installs VS Code himself and the world ends. A small
   // window, so the software renderer plays the fight at about its real speed
+  // 4b. The Hall of Fame against the database in memory (guinea-online=fake):
+  // world 0 won, the join modal over its end card, the nickname typed without
+  // moving the guinea pig, a guinea pig picked, the score on the board with my
+  // row marked, a nickname with an email refused, a new nickname saved, and
+  // "Remove me". A test link never sends anything to the real database.
+  {
+    for (const viewport of [{ width: 1280, height: 860 }, { width: 390, height: 844, mobile: true }]) {
+      const options = viewport.mobile ? { viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true } : { viewport };
+      const page = await newPage(options);
+      await page.goto(`${site.base}en/?guinea-test=1&guinea-online=fake`, { waitUntil: "load" });
+      await page.evaluate((key) => window.localStorage.removeItem(key), PROGRESS_KEY);
+      await typeKeys(page, KONAMI_ARROWS);
+      await waitState(page, "map");
+      if (!viewport.mobile) {
+        await page.click('.guinea-run [data-action="mode"][data-mode="hard"]');
+        const hard = await settles(page, () => page.locator('.guinea-run [data-mode="hard"].is-active').count(), 1);
+        const saved = await page.evaluate((key) => JSON.parse(window.localStorage.getItem(key) || "{}").mode, PROGRESS_KEY);
+        expect(hard && saved === "hard", `the map switches to Hard mode and the browser remembers it (${saved})`);
+        await page.click('.guinea-run [data-action="play"][data-world="0"]');
+        await waitState(page, "intro");
+        const line = (await page.textContent(".guinea-run .gr-mode-line").catch(() => "")) || "";
+        expect(/twice|2 times/.test(line) || /x2/.test(line), `the card of a world says it plays in Hard mode (${line})`);
+        await page.click('.guinea-run [data-action="map"]');
+        await waitState(page, "map");
+        await page.click('.guinea-run [data-action="mode"][data-mode="easy"]');
+        await settles(page, () => page.locator('.guinea-run [data-mode="easy"].is-active').count(), 1);
+      }
+      // Two rivals already on the board of world 0
+      await page.evaluate(() =>
+        window.__guineaRun.online.seed([
+          { name: "Octo-Cat", coat: "golden", boards: [{ board: "w0", score: 31000, stars: 3, bossMs: 41200 }] },
+          { name: "Jane-Doe", coat: "snow", boards: [{ board: "w0", score: 90, stars: 1 }] }
+        ])
+      );
+      await page.click('.guinea-run [data-action="play"][data-world="0"]');
+      await waitState(page, "intro");
+      await page.click('.guinea-run [data-action="start"]');
+      await waitState(page, "playing");
+      await page.evaluate(() => window.__guineaRun.finish());
+      await waitState(page, "done");
+      expect(await settles(page, () => joinSays(page, /Join the Hall of Fame/), true, 10000), `the first won world opens the join modal over its end card (${viewport.mobile ? "phone" : "desktop"})`);
+      expect(await joinSays(page, /Your first score!/), "the join modal shows the first score");
+      const fits = await page.evaluate(() => {
+        const save = document.querySelector(".guinea-run .gr-join .gr-hof-save").getBoundingClientRect();
+        return save.width > 0 && save.bottom <= window.innerHeight && document.documentElement.scrollWidth <= window.innerWidth;
+      });
+      expect(fits, "the call to action of the join modal is on screen, and nothing scrolls sideways");
+      await page.click(".guinea-run .gr-join .gr-hof-field input");
+      await page.keyboard.type("wasd-dev", { delay: 30 });
+      const typed = await page.inputValue(".guinea-run .gr-join .gr-hof-field input");
+      expect(typed === "wasd-dev" && (await state(page)) === "done", `the nickname box takes W, A, S and D as letters (${typed})`);
+      await page.click('.guinea-run .gr-join [data-coat="ginger"]');
+      await page.click(".guinea-run .gr-join .gr-hof-save");
+      expect(await settles(page, () => hofBoxSays(page, /Welcome to the Hall of Fame/), true, 10000), "joining closes the modal and the end card says the best scores are on their way");
+      expect((await page.locator(".guinea-run .gr-join").count()) === 0, "the join modal is gone once the player joined");
+      const db = await page.evaluate(() => window.__guineaRun.online.db());
+      expect(
+        db.names.some((n) => n.name === "wasd-dev" && n.coat === "ginger") && db.scores.some((s) => s.board === "w0" && s.score > 0) && (await page.evaluate(() => window.__guineaRun.online.profile().asked)),
+        "the nickname, the guinea pig and the score of world 0 reach the database, and the join box never comes back"
+      );
+      await page.click('.guinea-run .gr-modal-body [data-action="hof"][data-world="0"]');
+      expect(await waitState(page, "hof"), "the end card opens the board of its world");
+      expect(await settles(page, () => page.locator(".guinea-run .gr-hof-row").count(), 3, 15000), "the board of world 0 lists the three players");
+      const me = await page.textContent(".guinea-run .gr-hof-row.is-you .gr-hof-handle").catch(() => "");
+      expect(me === "wasd-dev", `the player's own row is marked (${me})`);
+      expect(viewport.mobile || (await page.locator(".guinea-run .gr-hof-time").count()) > 0, "the board of a world shows the boss times");
+      const wide = await page.evaluate(() => {
+        const panel = document.querySelector(".guinea-run .gr-panel");
+        return { page: document.documentElement.scrollWidth - window.innerWidth, panel: panel ? panel.scrollWidth - panel.clientWidth : 0 };
+      });
+      expect(wide.page <= 0 && wide.panel <= 1, `the Hall of Fame scrolls nowhere sideways (page ${wide.page} px, card ${wide.panel} px)`);
+      await page.click('.guinea-run [data-action="hof-tab"][data-tab="all"]');
+      const first = await settles(page, () => page.locator(".guinea-run .gr-hof-row .gr-hof-handle").first().textContent().catch(() => ""), "Octo-Cat", 15000);
+      expect(first, "the general board puts the best total first");
+      const field = ".guinea-run .gr-hof-send .gr-hof-field input";
+      expect((await page.inputValue(field)) === "wasd-dev", "the profile box shows the nickname");
+      await page.fill(field, "me@example.com");
+      await page.click(".guinea-run .gr-hof-send .gr-hof-save");
+      expect(/no email/.test((await page.textContent(".guinea-run .gr-hof-send .gr-hof-message")) || ""), "a nickname with an email is refused before anything is sent");
+      await page.fill(field, "wasd-dev2");
+      await page.click('.guinea-run .gr-hof-send [data-coat="slate"]');
+      await page.click(".guinea-run .gr-hof-send .gr-hof-save");
+      // The database takes one nickname every 10 s: the change may wait for its next try
+      const renamed = await settles(page, () => page.evaluate(() => window.__guineaRun.online.db().names.some((n) => n.name === "wasd-dev2" && n.coat === "slate")), true, 30000);
+      expect(renamed, "a new nickname and guinea pig are saved");
+      await page.click(".guinea-run .gr-hof-forget");
+      await page.click(".guinea-run .gr-hof-confirm .gr-button:first-of-type");
+      expect(await settles(page, () => page.textContent(".guinea-run .gr-hof-confirm").then((s) => /Removed/.test(s || "")), true, 10000), '"Remove me" says it is done');
+      const left = await page.evaluate(() => window.__guineaRun.online.db());
+      expect(!left.names.some((n) => n.name.startsWith("wasd-dev")) && (await page.evaluate(() => !window.__guineaRun.online.profile().id)), "removing the player deletes every row and stops the sends");
+      await page.evaluate((key) => window.localStorage.removeItem(key), PROGRESS_KEY);
+      await page.context().close();
+    }
+    const page = await newPage({ viewport: { width: 1280, height: 860 } });
+    await page.goto(`${site.base}fr/?guinea-test=1`, { waitUntil: "load" });
+    await typeKeys(page, KONAMI_ARROWS);
+    await waitState(page, "map");
+    await page.click('.guinea-run .gr-map-meta [data-action="hof"]');
+    await waitState(page, "hof");
+    const texts = await page.evaluate(() => ({
+      input: Boolean(document.querySelector(".guinea-run .gr-hof-field input")),
+      send: document.querySelector(".guinea-run .gr-hof-send")?.textContent || ""
+    }));
+    expect(!texts.input && /lien de test/.test(texts.send), "a test link sends nothing, and says so in French");
+    await page.context().close();
+  }
+
   {
     const page = await newPage({ viewport: { width: 640, height: 430 } });
     // guinea-at=860: past the Re-check door, 20 m before the admin
@@ -517,6 +677,8 @@ try {
     const [dumped, back, staged] = await Promise.all(["dumped", "thrownback", "staged"].map((name) => data(page, name).then(Number)));
     expect(dumped > 0 && back > 0 && staged === 4, `he threw crates, the guinea pig threw the junk back and kept its 4 files (${dumped} thrown, ${back} back, ${staged} staged)`);
     expect(await waitState(page, "done"), `the commit cards follow and world 2 ends (${await data(page, "bosstime")} s of game time for the fight)`);
+    const bonuses = (await page.textContent(".guinea-run .gr-bonuses").catch(() => "")) || "";
+    expect(/mistake/.test(bonuses) && /Boss beaten in \d+ s/.test(bonuses), `the end card lists the bonuses, mistakes and boss time included (${bonuses})`);
     await page.context().close();
   }
 
@@ -595,6 +757,188 @@ try {
     await page.context().close();
   }
 
+  // 5h. Pipeline Pinball, the bonus table
+  {
+    const allDone = (teaserSeen) => {
+      const worlds = {};
+      for (let w = 0; w < 10; w++) {
+        worlds[w] = { best: 1000, stars: 1 };
+      }
+      return JSON.stringify({ v: 1, unlocked: 9, worlds, badges: [1, 2, 3], notes: {}, plan: null, finished: true, bonus: { best: 0, record: null, teaserSeen }, bonuses: { orgman: { best: 0, record: null, teaserSeen } } });
+    };
+    // Hidden while a world is still to do
+    {
+      const page = await newPage({ viewport: { width: 1280, height: 860 } });
+      await page.goto(`${site.base}en/`, { waitUntil: "load" });
+      await page.evaluate((key) => window.localStorage.setItem(key, JSON.stringify({ v: 1, unlocked: 3, worlds: { 0: { best: 10, stars: 1 } }, badges: [], notes: {}, plan: null, finished: false })), PROGRESS_KEY);
+      await typeKeys(page, KONAMI_ARROWS);
+      await waitState(page, "map");
+      expect((await page.locator(".guinea-run .gr-bonus-card").count()) === 0, "the bonuses stay hidden while a world is still to do");
+      // Every world done: the teaser shows once, then the card on the map
+      await page.evaluate((args) => window.localStorage.setItem(args[0], args[1]), [PROGRESS_KEY, allDone(false)]);
+      await page.reload({ waitUntil: "load" });
+      await typeKeys(page, KONAMI_ARROWS);
+      expect(await waitState(page, "credits"), "a player who finished every world gets the teaser of the bonus table");
+      const teaser = (await page.textContent(".guinea-run .gr-panel")) || "";
+      expect(/One more thing/.test(teaser) && (await page.locator('.guinea-run [data-action="bonus"][data-world="pinball"]').count()) === 1, "the teaser offers to play Pipeline Pinball");
+      expect((await page.locator('.guinea-run [data-action="bonus"][data-world="orgman"]').count()) === 1 && /Org-Man/.test(teaser), "the same teaser offers Org-Man");
+      await page.click('.guinea-run [data-action="map"]');
+      expect(await waitState(page, "map"), "Later goes to the map");
+      expect((await page.locator(".guinea-run .gr-bonus-card").count()) === 2, "the map shows the cards of both bonuses once every world is done");
+      await page.reload({ waitUntil: "load" });
+      await typeKeys(page, KONAMI_ARROWS);
+      expect(await waitState(page, "map"), "the teaser shows only once");
+      await page.click('.guinea-run .gr-bonus-card [data-action="bonus"][data-world="pinball"]');
+      expect(await waitState(page, "intro"), "the card of the bonus table opens its intro");
+      // A player who knew the table before Org-Man existed gets the teaser of Org-Man alone, once
+      const before = JSON.parse(allDone(true));
+      before.bonuses.orgman.teaserSeen = false;
+      await page.evaluate((args) => window.localStorage.setItem(args[0], args[1]), [PROGRESS_KEY, JSON.stringify(before)]);
+      await page.reload({ waitUntil: "load" });
+      await typeKeys(page, KONAMI_ARROWS);
+      expect(await waitState(page, "credits"), "a player who knew the table gets the teaser of Org-Man");
+      expect(
+        (await page.locator('.guinea-run [data-action="bonus"][data-world="orgman"]').count()) === 1 && (await page.locator('.guinea-run [data-action="bonus"][data-world="pinball"]').count()) === 0,
+        "that teaser offers Org-Man alone"
+      );
+      await page.click('.guinea-run [data-action="bonus"][data-world="orgman"]');
+      expect(await waitState(page, "intro"), "the teaser opens the card of Org-Man");
+      await page.evaluate((key) => window.localStorage.removeItem(key), PROGRESS_KEY);
+      await page.context().close();
+    }
+    // Played: the flippers, the balls, the Production floor, the end
+    {
+      const page = await newPage({ viewport: { width: 1280, height: 860 } });
+      expect(await openWorld(page, "en", "pinball", "&guinea-online=fake"), "the bonus table opens its card");
+      await page.click('.guinea-run [data-action="bonus-new"]');
+      expect(await waitState(page, "playing"), "a game of Pipeline Pinball starts");
+      await page.waitForFunction(() => window.__guineaRun && window.__guineaRun.pinball, null, { timeout: 20000 }).catch(() => {});
+      const flippers = () => page.evaluate(() => window.__guineaRun.pinball.flippers());
+      await page.keyboard.down("ShiftLeft");
+      const up = await settles(page, () => flippers().then((f) => f.left && !f.right), true, 3000);
+      await page.keyboard.up("ShiftLeft");
+      const down = await settles(page, () => flippers().then((f) => !f.left), true, 3000);
+      expect(up && down, "the left flipper is up while Shift is held, and down once it is let go");
+      // The ball waits on the plunger: while it is the only one, the right half pulls the plunger.
+      // Space launches it first, then the halves of the screen are the flippers, as fingers do
+      await page.keyboard.down("Space");
+      await page.waitForTimeout(500);
+      await page.keyboard.up("Space");
+      await page.waitForTimeout(800);
+      await page.mouse.move(1000, 500);
+      await page.mouse.down();
+      const right = await settles(page, () => flippers().then((f) => f.right && !f.left), true, 3000);
+      await page.mouse.up();
+      expect(right && (await settles(page, () => flippers().then((f) => !f.right), true, 3000)), "a press on the right half of the screen holds the right flipper");
+      // Straight to the big moments, before the bot plays: its game may end within two minutes
+      await page.evaluate(() => window.__guineaRun.pinball.jump(1));
+      expect(await settles(page, () => page.evaluate(() => window.__guineaRun.pinball.balls().length), 3, 30000), "Deploy to all orgs puts three balls on the table");
+      await page.evaluate(() => window.__guineaRun.pinball.jump(3));
+      expect(await settles(page, () => page.evaluate(() => window.__guineaRun.pinball.balls().some((b) => b.floor === 1 && b.mode === "table")), true, 30000), "the production ramp takes a ball up to the Production floor");
+      // Five players on its board, the fifth at 5 points: the game passes it
+      await page.evaluate(() => window.__guineaRun.online.seed([1, 2, 3, 4, 5].map((i) => ({ name: "p" + i, board: "pinball", score: i, level: 1 }))));
+      expect(await settles(page, () => page.evaluate(() => window.__guineaRun.hofTarget()), 1, 5000), "the table knows the score of the fifth of its board");
+      await page.evaluate(() => window.__guineaRun.pinball.autoplay(true));
+      expect(await settles(page, () => data(page, "pb-top5"), "1", 30000), "the display flashes TOP 5 once the game passes the fifth of the board");
+      // Two minutes of the bot: the ball never leaves the table
+      let escaped = "";
+      let lost = false;
+      const until = Date.now() + 120000;
+      while (Date.now() < until && !escaped) {
+        await page.waitForTimeout(1000);
+        if ((await state(page)) !== "playing") {
+          lost = true;
+          break;
+        }
+        const balls = await page.evaluate(() => window.__guineaRun.pinball.balls());
+        for (const b of balls) {
+          // Past the walls: the top arc ends at 23.05, the arc of the Production floor at 33.5
+          const out = b.mode === "table" && (b.floor === 0 ? b.x < -5.6 || b.x > 6.7 || b.y > 23.4 : b.x < -4.1 || b.x > 4.1 || b.y > 33.8);
+          if (out) {
+            escaped = `${b.x.toFixed(2)},${b.y.toFixed(2)} on floor ${b.floor}`;
+          }
+        }
+      }
+      const hud = await page.evaluate(() => window.__guineaRun.pinball.hud());
+      expect(!escaped, `the bot played the table${lost ? " to the end of its game" : " for two minutes"} and no ball left it${escaped ? ": " + escaped : ""} (score ${hud.score})`);
+      expect(hud.score > 0, `the table scores (${hud.score} points)`);
+      if (!lost) {
+        await page.evaluate(() => window.__guineaRun.finish());
+      }
+      expect(await waitState(page, "done"), "a game of Pipeline Pinball ends on its card");
+      expect((await page.locator(".guinea-run .gr-score").count()) === 1, "the end card of the bonus table shows the score");
+      expect(await settles(page, () => joinSays(page, /Join the Hall of Fame/), true, 10000), "the end card of the bonus table opens the join modal for a player who never joined");
+      await page.click(".guinea-run .gr-join .gr-hof-skip");
+      expect((await page.locator(".guinea-run .gr-join").count()) === 0, "No thanks closes the join modal over the bonus table's end card");
+      await page.click('.guinea-run [data-action="map"]');
+      expect(await waitState(page, "map"), "the bonus table goes back to the map");
+      expect(await page.evaluate(() => !document.getElementById("guinea-run-world-css")), "the bonus table takes its styles away with it");
+      await page.context().close();
+    }
+    // Its board in the Hall of Fame
+    {
+      const page = await newPage({ viewport: { width: 1280, height: 860 } });
+      await page.goto(`${site.base}en/?guinea-test=1&guinea-online=fake`, { waitUntil: "load" });
+      await typeKeys(page, KONAMI_ARROWS);
+      await waitState(page, "map");
+      await page.evaluate(() => window.__guineaRun.online.seed([{ name: "Octo-Cat", coat: "chocolate", board: "pinball", score: 12345678, level: 2 }]));
+      await page.click('.guinea-run .gr-map-meta [data-action="hof"]');
+      await waitState(page, "hof");
+      await page.click('.guinea-run [data-action="hof-tab"][data-tab="pinball"]');
+      const row = await settles(page, () => page.locator(".guinea-run .gr-hof-row .gr-hof-handle").first().textContent().catch(() => ""), "Octo-Cat", 15000);
+      expect(row, "the Hall of Fame has a Pinball board, with the best game of each player");
+      await page.context().close();
+    }
+  }
+
+  // 5i. Org-Man, the second bonus
+  {
+    const page = await newPage({ viewport: { width: 1280, height: 860 } });
+    expect(await openWorld(page, "en", "orgman", "&guinea-online=fake"), "Org-Man opens its card");
+    await page.click('.guinea-run [data-action="bonus-new"]');
+    expect(await waitState(page, "playing"), "a game of Org-Man starts");
+    await page.waitForFunction(() => window.__guineaRun && window.__guineaRun.orgman, null, { timeout: 20000 }).catch(() => {});
+    const om = () => page.evaluate(() => window.__guineaRun.orgman.state());
+    // The software renderer of the check draws a few frames a second: Ready lasts longer than its 2.2 s of game time
+    expect(await settles(page, () => om().then((s) => s.phase), "play", 30000), "the maze goes from Ready to play");
+    const start = await om();
+    await page.keyboard.press("ArrowRight");
+    const moved = await settles(page, () => om().then((s) => s.pig.x !== start.pig.x || s.pig.y !== start.pig.y), true, 4000);
+    const facing = await om();
+    expect(moved && facing.pig.dir === 3, `the guinea pig follows the right arrow through the maze (${JSON.stringify(facing.pig)})`);
+    await page.evaluate(() => window.__guineaRun.orgman.jump("blue"));
+    expect(await settles(page, () => data(page, "om-blue"), "1", 3000), "a rocket turns the admins blue");
+    // Five players on its board, the fifth at 5 points: the game passes it
+    await page.evaluate(() => window.__guineaRun.online.seed([1, 2, 3, 4, 5].map((i) => ({ name: "p" + i, board: "orgman", score: i, level: 1 }))));
+    expect(await settles(page, () => page.evaluate(() => window.__guineaRun.hofTarget()), 1, 5000), "the maze knows the score of the fifth of its board");
+    await page.evaluate(() => window.__guineaRun.orgman.autoplay(true));
+    expect(await settles(page, () => data(page, "om-top5"), "1", 30000), "the score to beat flashes once the game passes the fifth of the board");
+    await page.evaluate(() => window.__guineaRun.orgman.jump("clear"));
+    expect(await settles(page, () => data(page, "om-card"), "1", 20000), "the last dot clears the maze, and the card between two mazes shows");
+    const card = (await page.textContent(".guinea-run .gr-om-card").catch(() => "")) || "";
+    expect(/Maze 1 cleared/.test(card) && /Next: Flow Builder/.test(card), `the card says the maze is cleared and names the next one (${card.slice(0, 120)})`);
+    expect(await settles(page, () => data(page, "om-level"), "2", 20000), "maze 2 starts after the card");
+    const score = (await om()).score;
+    expect(score > 0, `Org-Man scores (${score} points)`);
+    await page.evaluate(() => window.__guineaRun.finish());
+    expect(await waitState(page, "done"), "a game of Org-Man ends on its card");
+    expect((await page.locator(".guinea-run .gr-score").count()) === 1, "the end card of Org-Man shows the score");
+    expect(await settles(page, () => joinSays(page, /Join the Hall of Fame/), true, 10000), "the end card of Org-Man opens the join modal for a player who never joined");
+    await page.keyboard.press("Escape");
+    expect((await page.locator(".guinea-run .gr-join").count()) === 0 && (await state(page)) === "done", "Escape closes the join modal over Org-Man's end card, which stays");
+    await page.click('.guinea-run [data-action="map"]');
+    expect(await waitState(page, "map"), "Org-Man goes back to the map");
+    expect(await page.evaluate(() => !document.getElementById("guinea-run-world-css")), "Org-Man takes its styles away with it");
+    // Its board in the Hall of Fame
+    await page.evaluate(() => window.__guineaRun.online.seed([{ name: "Maze-Cat", coat: "slate", board: "orgman", score: 45678, level: 4 }]));
+    await page.click('.guinea-run .gr-map-meta [data-action="hof"]');
+    await waitState(page, "hof");
+    await page.click('.guinea-run [data-action="hof-tab"][data-tab="orgman"]');
+    const row = await settles(page, () => page.locator(".guinea-run .gr-hof-row .gr-hof-handle").first().textContent().catch(() => ""), "Maze-Cat", 15000);
+    expect(row, "the Hall of Fame has an Org-Man board, with the best game of each player");
+    await page.context().close();
+  }
+
   // 6. A phone: the footer guinea pig, the pads, swipes
   {
     const page = await newPage({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 3, isMobile: true, hasTouch: true });
@@ -644,6 +988,108 @@ try {
     await page.tap('.guinea-run [data-action="quit"]');
     await page.waitForTimeout(300);
     expect((await state(page)) === null, "the close button closes the game on a phone");
+    await page.context().close();
+  }
+
+  // 7. Offline: play.html saves the game once, then plays without a network
+  {
+    const page = await newPage({ viewport: { width: 1280, height: 860 } });
+    const play = `${site.base}theme/javascripts/guinea-run/play.html?guinea-offline=1`;
+    await page.goto(play, { waitUntil: "load" });
+    expect(await waitState(page, "map"), "play.html opens the map");
+    const saved = await page.evaluate(async () => {
+      const registration = await navigator.serviceWorker.ready;
+      const until = Date.now() + 60000;
+      while (Date.now() < until) {
+        const names = (await caches.keys()).filter((name) => name.startsWith("guinea-run-"));
+        if (names.length && registration.active) {
+          return (await (await caches.open(names[0])).keys()).length;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+      return 0;
+    });
+    expect(saved > 100, `play.html saves the whole game for offline play (${saved} files)`);
+    await page.context().route(/./, (route) => (new URL(route.request().url()).origin === new URL(site.base).origin ? route.continue() : route.abort()));
+    await page.context().setOffline(true);
+    for (const world of WORLDS.map((w) => String(w.id)).concat(BONUSES.map((b) => b.id))) {
+      await page.goto(`${play}&guinea-unlock=all&guinea-world=${world}`, { waitUntil: "load" });
+      expect(await waitState(page, "intro"), `offline, world ${world} opens from the saved copy`);
+    }
+    await page.goto(`${play}&guinea-unlock=all&guinea-world=1`, { waitUntil: "load" });
+    if (await waitState(page, "intro")) {
+      await page.click('.guinea-run [data-action="start"]');
+      expect(await waitState(page, "playing"), "offline, world 1 starts and plays");
+    }
+    await page.context().close();
+  }
+
+  // 8. The save VS Code shares between projects: a page plays the extension around play.html
+  {
+    const page = await newPage({ viewport: { width: 1280, height: 860 } });
+    const play = `${site.base}theme/javascripts/guinea-run/play.html?lang=en&from=vscode&save=host`;
+    // A page of the local site plays the panel: a routed page counts as public, and Chrome refuses it a loopback frame
+    await page.goto(`${site.base}404.html`, { waitUntil: "load" });
+    await page.evaluate((url) => {
+      // Over the page, which stays as it is (its own scripts expect their elements)
+      const frame = document.createElement("iframe");
+      frame.style.cssText = "position:fixed;inset:0;width:100%;height:100%;border:0;z-index:2147483647";
+      document.body.appendChild(frame);
+      window.file = null;
+      window.stored = [];
+      window.cleared = false;
+      window.addEventListener("message", (event) => {
+        const data = event.data || {};
+        if (event.source !== frame.contentWindow || data.source !== "guinea-run") {
+          return;
+        }
+        if (data.type === "loadSave") {
+          frame.contentWindow.postMessage({ source: "vscode-sfdx-hardis", type: "save", blob: window.file }, "*");
+        } else if (data.type === "storeSave") {
+          window.stored.push(data.blob);
+        } else if (data.type === "clearSave") {
+          window.cleared = true;
+          window.file = null;
+        }
+      });
+      window.openGame = (file) => {
+        window.file = file;
+        window.stored = [];
+        window.cleared = false;
+        frame.src = url;
+      };
+    }, play);
+    const gameFrame = () => page.frames().find((f) => f.url().includes("play.html"));
+    const frameState = async () => {
+      const frame = gameFrame();
+      return frame ? frame.evaluate(() => document.querySelector(".guinea-run")?.getAttribute("data-state") || null).catch(() => null) : null;
+    };
+    const openGame = async (file, wanted) => {
+      await page.evaluate((f) => window.openGame(f), file);
+      return settles(page, frameState, wanted, OPEN_TIMEOUT);
+    };
+
+    expect(await openGame(null, "map"), "in VS Code, the game asks for the shared save and opens the map");
+    const hint = await gameFrame().textContent(".guinea-run .gr-map-hint");
+    expect(/every VS Code project/.test(hint || ""), `in VS Code, the map says the progress follows every project (${hint})`);
+    await gameFrame().click('.guinea-run [data-action="mute"]');
+    const sent = await settles(page, () => page.evaluate(() => window.stored.some((blob) => JSON.parse(JSON.parse(blob).text).muted === "1")), true, 5000);
+    expect(sent, "in VS Code, a change (the sound muted) is sent to the extension, signed");
+    const good = await page.evaluate(() => window.stored[window.stored.length - 1]);
+
+    // Edited by hand: refused, everything cleared, the extension told to delete it
+    const edited = JSON.stringify(Object.assign(JSON.parse(good), { text: JSON.parse(good).text.replace('"muted":"1"', '"muted":"0"') }));
+    expect(await openGame(edited, "credits"), "a shared save edited by hand shows the card that refuses it");
+    const title = await gameFrame().textContent(".guinea-run .gr-modal-header h2");
+    expect(/Nice try/.test(title || ""), `the refused save says why (${title})`);
+    expect(await page.evaluate(() => window.cleared), "a refused save is deleted by the extension");
+    const left = await gameFrame().evaluate(() => window.localStorage.getItem("guinea-run-muted"));
+    expect(left === null, "a refused save clears what the game kept in this project");
+
+    // Valid again: it is put back into this project's storage
+    expect(await openGame(good, "map"), "a valid shared save opens the map");
+    const muted = await gameFrame().evaluate(() => window.localStorage.getItem("guinea-run-muted"));
+    expect(muted === "1", "a valid shared save comes back into this project's storage");
     await page.context().close();
   }
 } finally {
